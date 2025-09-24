@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
@@ -10,6 +11,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
+using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
 using DevExpress.Mvvm;
 using Esri.ArcGISRuntime;
@@ -52,7 +54,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     private const string ObjectId = "ObjectId";
     private const string ClusterIdAttribute = "ClusterId";
     private const string ClusterImpulseCountAttribute = "ClusterImpulseCount";
-
+    
     private const string CreationDate = "CreationDate";
     private const string Longitude = "Longitude";
     private const string Latitude = "Latitude";
@@ -84,6 +86,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     protected GraphicsOverlay? TdoaSimulationHeatmapOverlay;
     protected GraphicsOverlay? TdoaSimulationEllipseOverlay;
     protected GraphicsOverlay? GekataTrajectoryOverlay;
+    protected GraphicsOverlay? ObjectTrajectoryOverlay;
     private Viewpoint? _viewpoint;
     private readonly ConcurrentDictionary<uint, MapPoint> _receiverPoints = [];
     private readonly ConcurrentDictionary<uint, Color> _linkedStationColors = [];
@@ -93,6 +96,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     private double _antennaDirection;
     private Cursor? _mapCursor;
     private Graphic? _selectedClusterGraphic;
+    private Graphic? _objectTrajectoryGraphic;
     private readonly SimpleLineSymbol _directionLineSymbol;
     private readonly SimpleLineSymbol _selectedDirectionLineSymbol;
     private readonly IDatabaseMessagingService _databaseMessagingService;
@@ -107,6 +111,8 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     private bool _isPtoaHyperbolaVisible;
     private bool _isControlEnabled;
     private readonly CircularBuffer<TrajectoryPoint> _trajectoryPoints;
+    private bool _isEditMode;
+    private bool _isObjectTrajectoryVisible;
 
     public class PtoaGraphics
     {
@@ -119,6 +125,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     protected ConcurrentDictionary<string, PtoaGraphics> PtoaStorage = new();
     private Graphic? _tdoaSimulationEllipseCenterPoint;
     private MapObjectViewModel? _editMapObjectVm;
+    private MapObjectViewModel? _selectedMapObjectVm;
     private int _currentObjectSize;
 
     private double LineDistance => _mapSettings.BearingDistanceKm;
@@ -312,6 +319,37 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         set => Set(ref _isOverviewMapVisible, value);
     }
 
+    public MapObjectViewModel? SelectedMapObject {
+        get => _selectedMapObjectVm;
+        set {
+            if (Set(ref _selectedMapObjectVm, value)) {
+                if (value != null) {
+                    value.MapObjectTrajectories.CollectionChanged -= MapObjectTrajectoriesCollectionChanged;
+                    value.MapObjectTrajectories.CollectionChanged += MapObjectTrajectoriesCollectionChanged;
+                }
+
+                if (IsObjectTrajectoryVisible && value != null) {
+                    DrawObjectTrajectory(value);
+                } else {
+                    ClearObjectTrajectory();
+                }
+            }
+        }
+    }
+
+    public bool IsObjectTrajectoryVisible {
+        get => _isObjectTrajectoryVisible;
+        set {
+            if (Set(ref _isObjectTrajectoryVisible, value)) {
+                if (!value) {
+                    ClearObjectTrajectory();
+                } else if (SelectedMapObject != null) {
+                    DrawObjectTrajectory(SelectedMapObject);
+                }
+            }
+        }
+    }
+
     public double OverviewMapScaleFactor => _mapSettings.OverviewMapScaleFactor;
 
     public double OverviewMapHeight => _mapSettings.OverviewMapHeight;
@@ -319,6 +357,11 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     public double OverviewMapWidth => _mapSettings.OverviewMapWidth;
 
     public bool IsUiAvailable => IsServerConnected && IsControlEnabled;
+
+    public bool IsEditMode {
+        get => _isEditMode;
+        set=> Set(ref _isEditMode, value);
+    }
 
     public ICommand GoToReceiverPositionCommand { get; }
     public DelegateCommand AddObjectCommand { get; }
@@ -329,6 +372,8 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
     public DelegateCommand<MouseButtonEventArgs> MouseLeftButtonUpCommand { get; }
     public DelegateCommand<Guid?> SelectClusterDirectionCommand { get; }
     public DelegateCommand<MouseEventArgs> MouseMoveCommand { get; }
+    public IRelayCommand SaveFromPanelCommand { get; }
+    public IRelayCommand CancelEditCommand { get; }
 
     public MainMapViewModel(IOptions<MapSettings> mapOptions,
         MessageLogger messageLogger, IDatabaseMessagingService databaseMessagingService,
@@ -361,6 +406,14 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         MouseLeftButtonUpCommand = new DelegateCommand<MouseButtonEventArgs>(MouseLeftButtonUp);
         SelectClusterDirectionCommand = new DelegateCommand<Guid?>(SelectClusterDirection);
         MouseMoveCommand = new DelegateCommand<MouseEventArgs>(MouseMove);
+        SaveFromPanelCommand = new RelayCommand(() => {
+            SelectedMapObject?.SaveCommand.Execute(null);
+        });
+        CancelEditCommand = new RelayCommand(() => {
+            IsEditMode = false;
+            SelectedMapObject = null;
+            OnPropertyChanged(nameof(IsEditMode));
+        });
         _dispatcher = dispatcherWrapper ?? new DispatcherWrapper(Application.Current.Dispatcher);
 
         Map = CreateMap();
@@ -394,8 +447,8 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         messenger.Register<VisibleClustersUpdatedMessage>(this,
             (_, m) => OnVisibleClustersUpdated(m.Value));
         messenger.Register<PtoaResultReceivedMessage>(this,
-            (_, m) => OnPtoaResultsReceived(m.Value.CalculationId, m.Value.IsCalculationStopped, m.Value.ObjectPosition,
-                m.Value.Time, m.Value.Ellipse, m.Value.ThinHyperboles));
+            (_, m) => OnPtoaResultsReceived(m.Value.CalculationId, m.Value.IsCalculationStopped, m.Value.Longitude,
+                m.Value.Latitude, m.Value.Time, m.Value.Ellipse, m.Value.ThinHyperboles));
         messenger.Register<TdoaMapSimulationResultReceivedMessage>(this,
             (_, m) => OnTdoaMapSimulationResultReceived(m.Value.Time, m.Value.ThinHyperboles, m.Value.Ellipse));
         _messenger.Register<ControlStatusChangedMessage>(this,
@@ -403,6 +456,42 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         _messenger.Register<DeviceInfoReceivedMessage>(this,
             (_, m) => OnDeviceInfoReceived(m.Value.DeviceInfo, m.Value.StationId, m.Value.DateTime));
         systemControlMessagingService.MapObjectUpdated += OnMapObjectUpdated;
+    }
+
+    private void DrawObjectTrajectory(MapObjectViewModel obj) {
+        if (ObjectTrajectoryOverlay == null) {
+            return;
+        }
+
+        var pts = obj.MapObjectTrajectories?
+            .Select(t => new MapPoint(t.Longitude, t.Latitude, SpatialReferences.Wgs84))
+            .ToList();
+        if (pts == null || pts.Count < 2) {
+            ClearObjectTrajectory();
+            return;
+        }
+        var pointGraphic = new SimpleMarkerSymbol(SimpleMarkerSymbolStyle.Circle, TrajectoryColor, TrajectoryPointSizePx);
+        var polylineBuilder = new PolylineBuilder(pts, SpatialReferences.Wgs84);
+        var lineGraphic = new Graphic(polylineBuilder.ToGeometry(),
+            new SimpleLineSymbol(SimpleLineSymbolStyle.Solid, TrajectoryColor, TrajectoryLineWidthPx));
+        _dispatcher.InvokeAsync(() => {
+            ObjectTrajectoryOverlay.Graphics.Clear();
+        foreach (var point in pts) {
+                ObjectTrajectoryOverlay.Graphics.Add(new Graphic(point, pointGraphic));
+            }
+            ObjectTrajectoryOverlay.Graphics.Add(lineGraphic);
+        });
+    }
+
+    private void ClearObjectTrajectory() {
+        _objectTrajectoryGraphic = null;
+        ObjectTrajectoryOverlay?.Graphics.Clear();
+    }
+
+    private void MapObjectTrajectoriesCollectionChanged(object? s, NotifyCollectionChangedEventArgs e) {
+        if (IsObjectTrajectoryVisible && SelectedMapObject != null) {
+            DrawObjectTrajectory(SelectedMapObject);
+        }
     }
 
     private void OnDeviceInfoReceived(DeviceInfo deviceInfo, uint stationId, DateTime dateTime) {
@@ -531,10 +620,10 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         PtoaStorage.Clear();
     }
 
-    private void OnPtoaResultsReceived(string calculationId, bool isCalculationStopped, GeographicalPosition? objectPosition,
-        DateTime? time, Ellipse? ellipse, GeographicalPosition[][]? valueThinHyperboles) {
+    private void OnPtoaResultsReceived(string calculationId, bool isCalculationStopped, double? longitude,
+        double? latitude, DateTime? time, Ellipse? ellipse, GeographicalPosition[][]? valueThinHyperboles) {
         var calculation = PtoaStorage.GetOrAdd(calculationId, new PtoaGraphics());
-
+       
         if (isCalculationStopped) {
             TdoaResultsOverlay?.Graphics.Clear();
             calculation.Heatmap?.Graphics.Clear();
@@ -591,7 +680,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         return GeometryEngine.EllipseGeodesic(parameters);
     }
 
-    private void ReceiverMessagingServiceOnConnectionChanged(object? sender,
+    private async void ReceiverMessagingServiceOnConnectionChanged(object? sender,
         ConnectionChangedNotification notification) {
         if (notification.StationId != _localStationId) {
             return;
@@ -599,6 +688,11 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
 
         ReceiverIsConnected = notification.IsConnected;
         OnPropertyChanged(nameof(ReceiverIsConnected));
+
+        await _dispatcher.InvokeAsync(() => {
+            IsObjectTrajectoryVisible = false;
+            ClearObjectTrajectory();
+        });
 
         if (ReceiverIsConnected) {
             _ = Task.Run(async () => {
@@ -803,6 +897,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         TdoaSimulationHeatmapOverlay = new GraphicsOverlay();
         TdoaSimulationEllipseOverlay = new GraphicsOverlay();
         GekataTrajectoryOverlay = new GraphicsOverlay();
+        ObjectTrajectoryOverlay = new GraphicsOverlay();
         _dispatcher.InvokeAsync(() =>
             Overlays.AddRange([
                 ReviewSectorOverlay,
@@ -810,7 +905,8 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
                 TdoaResultsOverlay,
                 TdoaSimulationHeatmapOverlay,
                 TdoaSimulationEllipseOverlay,
-                GekataTrajectoryOverlay
+                GekataTrajectoryOverlay,
+                ObjectTrajectoryOverlay
             ]));
         IsDoaVisible = true;
         IsPtoaEllipseVisible = true;
@@ -887,13 +983,22 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         var point = GetOrCreateReceiverMapPoint(stationId);
 
         receiverGraphic = new Graphic(point) {
-            ZIndex = MainOverlay.Graphics.Count + 1
+            ZIndex = MainOverlay.Graphics.Count + 1,
+            Attributes = {
+                { App6StyleSymbolFieldNames.Affiliation, (int)Affiliation.Friend },
+                { App6StyleSymbolFieldNames.Status, (int)SymbolStatus.Suspected },
+                { App6StyleSymbolFieldNames.SymbolSet, (int)SymbolSet.LandUnits },
+                { App6StyleSymbolFieldNames.SymbolEntity, (int)SymbolEntity.DirectionFinding },
+                { App6StyleSymbolFieldNames.Direction, AntennaDirection },
+                { App6StyleTextFieldNames.AdditionalInformation, stationId }
+            }
         };
 
         SetReceiverAttributes(receiverGraphic, GetStationType(stationId), stationId);
 
         _dispatcher.Invoke(() => MainOverlay.Graphics.Add(receiverGraphic));
         _receiverGraphics[stationId] = receiverGraphic;
+
         return receiverGraphic;
     }
 
@@ -968,9 +1073,9 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
             return;
         }
 
-        var viewModel = new MapObjectViewModel(_currentPosition.Y, _currentPosition.X);
-        viewModel.ObjectSaving += MapObjectSaving;
-        ShowMapObjectWindow(viewModel);
+        SelectedMapObject = new MapObjectViewModel(_currentPosition.Y, _currentPosition.X);
+        SelectedMapObject.ObjectSaving += MapObjectSaving;
+        IsEditMode = true;
     }
 
 #pragma warning disable VSTHRD100
@@ -978,9 +1083,9 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
 #pragma warning restore VSTHRD100
         var response = await _databaseMessagingService.SaveMapObject(mapObjectVm.ToModel());
         if (response is { IsSuccess: true, MapObject: not null }) {
-            var mapObj = MapObjects.FirstOrDefault(x => x.Id == response.MapObject.Id);
-            if (mapObj != null) {
-                MapObjects.Remove(mapObj);
+            var savedMapObject = UpdateOrAddMapObjectToList(response.MapObject);
+            if (SelectedMapObject is { Id: null }) {
+                SelectedMapObject.Id = savedMapObject.Id;
             }
 
             MapObjects.Add(response.MapObject);
@@ -989,6 +1094,50 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
         } else {
             _messageLogger.AddMessage(MessageCategory.System, response.ErrorMessage ?? "Error while saving map object",
                 MessageLevel.Error);
+        }
+    }
+
+    private MapObject UpdateOrAddMapObjectToList(MapObject savedMapObject) {
+        var existingMapObject = MapObjects.FirstOrDefault(x => x.Id == savedMapObject.Id);
+
+        if (existingMapObject != null) {
+            UpdateExistingMapObject(existingMapObject, savedMapObject);
+            return existingMapObject;
+        }
+
+        MapObjects.Add(savedMapObject);
+        return savedMapObject;
+    }
+
+    private void UpdateExistingMapObject(MapObject existing, MapObject updated) {
+        existing.Lat = updated.Lat;
+        existing.Lon = updated.Lon;
+        existing.Name = updated.Name;
+        existing.Sidc = updated.Sidc;
+        existing.DateTime = updated.DateTime;
+    }
+    
+    private async Task SaveMapObjectTrajectory(MapObject mapObject) {
+        try {
+            var trajectory = new MapObjectTrajectory {
+                MapObjectId = mapObject.Id,
+                Latitude = mapObject.Lat,
+                Longitude = mapObject.Lon,
+                CreatedOn = DateTime.UtcNow
+            };
+            var response = await _databaseMessagingService.SaveMapObjectTrajectory(trajectory);
+            if (response is { IsSuccess: false, Trajectory: not null }) {
+                mapObject.MapObjectTrajectories ??= new List<MapObjectTrajectory>();
+                mapObject.MapObjectTrajectories.Add(response.Trajectory);
+                if (SelectedMapObject != null && SelectedMapObject.Id == mapObject.Id) {
+                    SelectedMapObject.MapObjectTrajectories?.Add(response.Trajectory);
+                }
+            } else if (!response.IsSuccess) {
+                _messageLogger.AddMessage(MessageCategory.System,
+                    response.ErrorMessage ?? "Error while saving map object trajectory", MessageLevel.Error);
+            }
+        } catch (Exception e) {
+            _messageLogger.AddMessage(MessageCategory.System, e.Message, MessageLevel.Error);
         }
     }
 
@@ -1024,9 +1173,9 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
             return;
         }
 
-        _editMapObjectVm = new MapObjectViewModel(mapObject);
-        _editMapObjectVm.ObjectSaving += MapObjectSaving;
-        ShowMapObjectWindow(_editMapObjectVm);
+        SelectedMapObject = new MapObjectViewModel(mapObject);
+        SelectedMapObject.ObjectSaving += MapObjectSaving;
+        IsEditMode = true;
     }
 
     private async Task RemoveObject() {
@@ -1072,6 +1221,19 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
 
                     _currentObjectId = objId as Guid?;
                     OnPropertyChanged(nameof(IsCurrentObjectNotNull));
+                    if (mouseArgs.ChangedButton == MouseButton.Right) {
+                        return;
+                    }
+                    if (_currentObjectId != null) {
+                        var mapObject = MapObjects.FirstOrDefault(x => x.Id == _currentObjectId);
+                        if (mapObject != null) {
+                            SelectedMapObject = new MapObjectViewModel(mapObject);
+                            IsEditMode = false;
+                        }
+                    } else {
+                        SelectedMapObject = null;
+                        IsEditMode = false;
+                    }
                 }
             }
         }
@@ -1199,6 +1361,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
             return;
         }
 
+        SavePosition(args);
         _dispatcher.Invoke(mapView.DismissCallout);
     }
 
@@ -1514,7 +1677,7 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
                 }
             };
             calculationPoints.Add(graphic);
-
+            
             _dispatcher.Invoke(() => overlay.Graphics.Add(graphic));
         }
     }
@@ -1534,21 +1697,16 @@ public class MainMapViewModel : BaseViewModel, IMainMapViewModel
 
     private void OnMapObjectUpdated(object? sender, MapObjectUpdatedNotification notification) {
         foreach (var mapObject in notification.MapObjects) {
-            var mapObj = MapObjects.FirstOrDefault(x => x.Id == mapObject.Id);
-            if (mapObj != null) {
-                MapObjects.Remove(mapObj);
-            }
-
-            if (_editMapObjectVm != null && _editMapObjectVm.Id == mapObject.Id) {
+            var savedMapObject = UpdateOrAddMapObjectToList(mapObject);
+            if (SelectedMapObject != null && SelectedMapObject.Id == savedMapObject.Id) {
                 _dispatcher.Invoke(() => {
-                    _editMapObjectVm.Lat = mapObject.Lat;
-                    _editMapObjectVm.Lon = mapObject.Lon;
+                    SelectedMapObject.Lat = savedMapObject.Lat;
+                    SelectedMapObject.Lon = savedMapObject.Lon;
                 });
             }
-
-            MapObjects.Add(mapObject);
-            _messenger.Send(new MapObjectUpdatedMessage(mapObject));
-            AddOrUpdateObjectToMap(mapObject);
+            
+            _messenger.Send(new MapObjectUpdatedMessage(savedMapObject));
+            AddOrUpdateObjectToMap(savedMapObject);
         }
     }
 }
